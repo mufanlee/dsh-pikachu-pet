@@ -1,0 +1,27 @@
+NOTICE
+
+This repository is an unofficial, fan-made project. It is not affiliated with,
+endorsed by, or sponsored by Nintendo, Creatures Inc., GAME FREAK Inc., or
+The Pokémon Company.
+
+License scope
+-------------
+The MIT license in LICENSE covers only the source code authored in this
+repository (for example src/, index.js, cordis.patch.yml, package.json and the
+build/verification scripts). It does NOT cover the Pokémon-related artwork or
+audio assets.
+
+Third-party assets
+------------------
+- Pose artwork under assets/pose-*.webp and the plugin icon icon.png were
+  cropped from free Pikachu images found online; the original source and author
+  were not recorded. Pokémon and Pikachu are trademarks of Nintendo /
+  Creatures / GAME FREAK.
+- Cry clips under assets/pika-cry-*.ogg were derived from the open-source fan
+  game https://github.com/gorisanson/pikachu-volleyball
+  (WAVE140_1.wav, WAVE141_1.wav, WAVE144_1.wav), normalized and transcoded.
+
+These assets are included for personal, non-commercial fan use only. They are
+not licensed for redistribution, commercial use, or reuse in other projects.
+If you are a rights holder and would like content removed, please open an issue
+in this repository.

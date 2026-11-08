@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Pikachu Desktop Pet",
+    "description": "A Pikachu companion in the bottom-right corner of the Web GUI. It follows the Agent's working state, changes its pose accordingly, and chirps \"pika-pika\" when a task finishes."
+  }
+}
