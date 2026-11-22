@@ -108,7 +108,7 @@ window.__ModuleLoader__.load({
 
     function localeId(ctx) {
       try {
-        const locale = ctx && (ctx.locale || (typeof ctx.get === 'function' ? ctx.get('locale') : null));
+        const locale = serviceOf(ctx, 'locale');
         const snapshot = locale && typeof locale.getSnapshot === 'function' ? locale.getSnapshot() : null;
         if (snapshot && typeof snapshot.active === 'string' && snapshot.active) return snapshot.active;
       } catch (error) { /* noop */ }
@@ -135,24 +135,31 @@ window.__ModuleLoader__.load({
       return wallets[0] || null;
     }
 
+    /* Service lookup through ctx.get() only. Reading a service as a property
+     * (ctx.remote) throws in Cordis when the plugin did not inject it, which
+     * used to abort apply() and hide the whole pet. */
+    function serviceOf(ctx, name) {
+      try {
+        return ctx && typeof ctx.get === 'function' ? ctx.get(name) : null;
+      } catch (error) { /* noop */ }
+      return null;
+    }
+
     /* Resolve the account Remote namespace without hard-injecting it: users
      * without an account service still get the pet, just no balance chip. */
     function getAccountService(ctx) {
       try {
-        if (ctx && ctx.remote && ctx.remote.account) return ctx.remote.account;
-        if (ctx && typeof ctx.get === 'function') {
-          const direct = ctx.get('remote.account');
-          if (direct) return direct;
-          const remote = ctx.get('remote');
-          if (remote && remote.account) return remote.account;
-        }
+        const direct = serviceOf(ctx, 'remote.account');
+        if (direct) return direct;
+        const remote = serviceOf(ctx, 'remote');
+        if (remote && remote.account) return remote.account;
       } catch (error) { /* noop */ }
       return null;
     }
 
     function createBalanceStore(ctx) {
       const account = getAccountService(ctx);
-      const remote = (ctx && ctx.remote) || (ctx && typeof ctx.get === 'function' ? ctx.get('remote') : null) || null;
+      const remote = serviceOf(ctx, 'remote');
       const listeners = new Set();
       let state = {
         phase: account ? 'loading' : 'unavailable',
@@ -263,7 +270,7 @@ window.__ModuleLoader__.load({
         if (disposed || !account || typeof account.watch !== 'function') return;
         if (!remote || typeof remote.$stream !== 'function') return;
         try {
-          const remoteAccess = ctx.remoteAccess || (typeof ctx.get === 'function' ? ctx.get('remoteAccess') : null);
+          const remoteAccess = serviceOf(ctx, 'remoteAccess');
           if (remoteAccess && typeof remoteAccess.whenAccess === 'function') {
             watchDispose = remoteAccess.whenAccess('account/watch', function* () {
               const opened = openStream();
@@ -779,7 +786,7 @@ window.__ModuleLoader__.load({
 
     function openAccountSettings() {
       try {
-        const layout = runtimeCtx && (runtimeCtx.layout || (typeof runtimeCtx.get === 'function' ? runtimeCtx.get('layout') : null));
+        const layout = serviceOf(runtimeCtx, 'layout');
         if (layout && typeof layout.selectPanel === 'function') layout.selectPanel('settings');
       } catch (error) { /* hint remains */ }
     }
@@ -1090,15 +1097,8 @@ window.__ModuleLoader__.load({
       apply(ctx) {
         runtimeCtx = ctx;
         installLocale(ctx);
-        ctx.effect(function () {
-          if (balanceStore) balanceStore.dispose();
-          balanceStore = createBalanceStore(ctx);
-          balanceStore.start();
-          return function () {
-            balanceStore.dispose();
-            balanceStore = null;
-          };
-        }, 'pikachu-pet: balance');
+        /* Register the pet and its setting first: the balance chip is an
+         * optional extra and must never stop the pet from appearing. */
         ctx.slots.inject('shell.overlay', function () {
           return ctx.slots.register({
             name: 'shell.overlay',
@@ -1114,6 +1114,25 @@ window.__ModuleLoader__.load({
             order: 25,
           }, SoundSettingsRow);
         });
+        try {
+          ctx.effect(function () {
+            try {
+              if (balanceStore) balanceStore.dispose();
+              balanceStore = createBalanceStore(ctx);
+              balanceStore.start();
+            } catch (error) {
+              balanceStore = null;
+            }
+            return function () {
+              if (balanceStore) {
+                balanceStore.dispose();
+                balanceStore = null;
+              }
+            };
+          }, 'pikachu-pet: balance');
+        } catch (error) {
+          balanceStore = null;
+        }
       },
       __test: {
         clientVersion: clientVersion,

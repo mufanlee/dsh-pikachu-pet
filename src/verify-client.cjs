@@ -137,6 +137,25 @@ if (built) {
     check(registrations.indexOf('pikachu-pet') >= 0, 'shell.overlay registration missing');
     check(registrations.indexOf('pikachu-pet.sound') >= 0, 'settings.general.item registration missing');
 
+    // Cordis throws when a non-injected service is read as a property. The pet
+    // must still register through ctx.get(), even if ctx.remote throws.
+    const strictRegistrations = [];
+    const strictSlots = {
+      inject: (_key, callback) => { callback(); return () => {}; },
+      register: (options) => { strictRegistrations.push(options.id); return () => {}; },
+    };
+    const strictCtx = {
+      get: (name) => (name === 'remote' ? remoteStub : undefined),
+      effect: (callback) => callback(),
+      slots: strictSlots,
+    };
+    Object.defineProperty(strictCtx, 'remote', {
+      get() { throw new Error('cannot get property "remote" without inject'); },
+    });
+    plugin.apply(strictCtx);
+    check(strictRegistrations.indexOf('pikachu-pet') >= 0, 'pet must register when ctx.remote throws');
+    check(strictRegistrations.indexOf('pikachu-pet.sound') >= 0, 'sound row must register when ctx.remote throws');
+
     let localeRegistered = null;
     plugin.apply({
       get: (name) => (name === 'locale'
