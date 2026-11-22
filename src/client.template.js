@@ -92,6 +92,248 @@ window.__ModuleLoader__.load({
       return pool[Math.floor(Math.random() * pool.length)];
     }
 
+    const FALLBACK_CLIENT_VERSION = '0.2.2-rc.5';
+    const BALANCE_POLL_MS = 60000;
+    const STREAM_RETRY_MS = 5000;
+    const STREAM_MAX_RETRIES = 3;
+
+    function clientVersion() {
+      try {
+        const boot = typeof window !== 'undefined' ? window.__DSH_BOOT__ : null;
+        const version = boot && boot.release && boot.release.version;
+        if (typeof version === 'string' && version.length > 0) return version;
+      } catch (error) { /* noop */ }
+      return FALLBACK_CLIENT_VERSION;
+    }
+
+    function localeId(ctx) {
+      try {
+        const locale = ctx && (ctx.locale || (typeof ctx.get === 'function' ? ctx.get('locale') : null));
+        const snapshot = locale && typeof locale.getSnapshot === 'function' ? locale.getSnapshot() : null;
+        if (snapshot && typeof snapshot.active === 'string' && snapshot.active) return snapshot.active;
+      } catch (error) { /* noop */ }
+      return 'zh-CN';
+    }
+
+    function formatWallet(wallet, locale) {
+      if (!wallet || typeof wallet.balance !== 'string') return '';
+      const currency = wallet.currency === 'USD' ? 'USD' : 'CNY';
+      const amount = Number(wallet.balance.replace(/,/g, ''));
+      if (!Number.isFinite(amount)) return wallet.balance;
+      try {
+        return new Intl.NumberFormat(locale || 'zh-CN', { style: 'currency', currency: currency }).format(amount);
+      } catch (error) {
+        return (currency === 'USD' ? '$' : '¥') + amount.toFixed(2);
+      }
+    }
+
+    function pickPrimaryWallet(wallets) {
+      if (!Array.isArray(wallets) || wallets.length === 0) return null;
+      for (let index = 0; index < wallets.length; index += 1) {
+        if (wallets[index] && wallets[index].currency === 'CNY') return wallets[index];
+      }
+      return wallets[0] || null;
+    }
+
+    /* Resolve the account Remote namespace without hard-injecting it: users
+     * without an account service still get the pet, just no balance chip. */
+    function getAccountService(ctx) {
+      try {
+        if (ctx && ctx.remote && ctx.remote.account) return ctx.remote.account;
+        if (ctx && typeof ctx.get === 'function') {
+          const direct = ctx.get('remote.account');
+          if (direct) return direct;
+          const remote = ctx.get('remote');
+          if (remote && remote.account) return remote.account;
+        }
+      } catch (error) { /* noop */ }
+      return null;
+    }
+
+    function createBalanceStore(ctx) {
+      const account = getAccountService(ctx);
+      const remote = (ctx && ctx.remote) || (ctx && typeof ctx.get === 'function' ? ctx.get('remote') : null) || null;
+      const listeners = new Set();
+      let state = {
+        phase: account ? 'loading' : 'unavailable',
+        wallets: [],
+        bonusWallets: [],
+        updatedAt: 0,
+        stale: false,
+        error: '',
+      };
+      let disposed = false;
+      let timer = null;
+      let stream = null;
+      let watchDispose = null;
+      let retries = 0;
+      let refreshPromise = null;
+
+      function emit(patch) {
+        state = Object.assign({}, state, patch);
+        listeners.forEach(function (listener) {
+          try { listener(); } catch (error) { /* noop */ }
+        });
+      }
+
+      function getSnapshot() { return state; }
+
+      function subscribe(listener) {
+        listeners.add(listener);
+        return function () { listeners.delete(listener); };
+      }
+
+      function requestMeta() {
+        return {
+          version: clientVersion(),
+          locale: localeId(ctx),
+          timezoneOffsetSeconds: -new Date().getTimezoneOffset() * 60,
+        };
+      }
+
+      function refresh() {
+        if (disposed || !account) return Promise.resolve();
+        if (refreshPromise) return refreshPromise;
+        refreshPromise = Promise.resolve()
+          .then(function () { return account.getBalance(requestMeta()); })
+          .then(function (result) {
+            if (disposed) return;
+            if (!result || result.ok !== true) throw new Error('balance request failed');
+            const value = result.value;
+            if (value == null) {
+              emit({ phase: 'signed-out', wallets: [], bonusWallets: [], updatedAt: Date.now(), stale: false, error: '' });
+              return;
+            }
+            if (value.status !== 'ready') throw new Error('balance unavailable');
+            emit({
+              phase: 'ready',
+              wallets: Array.isArray(value.value) ? value.value.slice() : [],
+              bonusWallets: Array.isArray(value.bonusWallets) ? value.bonusWallets.slice() : [],
+              updatedAt: Date.now(),
+              stale: false,
+              error: '',
+            });
+          })
+          .catch(function (error) {
+            if (disposed) return;
+            const keep = state.phase === 'ready';
+            emit({
+              phase: keep ? 'ready' : 'error',
+              stale: keep,
+              error: error && error.message ? error.message : 'balance request failed',
+            });
+          })
+          .then(function () { refreshPromise = null; });
+        return refreshPromise;
+      }
+
+      function handleFrame(frame) {
+        if (!frame || !frame.state) return;
+        if (frame.state.status === 'signed-out') {
+          emit({ phase: 'signed-out', wallets: [], bonusWallets: [], updatedAt: Date.now(), stale: false, error: '' });
+          return;
+        }
+        if (frame.type === 'credentials-changed' || state.phase === 'loading' || state.phase === 'signed-out') {
+          retries = 0;
+          refresh();
+        }
+      }
+
+      function consume(readable) {
+        (async function () {
+          try {
+            for await (const frame of readable) {
+              if (disposed) return;
+              handleFrame(frame);
+            }
+          } catch (error) { /* $stream callbacks own end/failure */ }
+        })();
+      }
+
+      function openStream() {
+        return remote.$stream({
+          name: 'account',
+          open: function (signal) { return account.watch(signal); },
+          ended: function () { stream = null; scheduleReconnect(); },
+          carrierFailed: function () { /* polling stays in charge */ },
+        });
+      }
+
+      function connect() {
+        if (disposed || !account || typeof account.watch !== 'function') return;
+        if (!remote || typeof remote.$stream !== 'function') return;
+        try {
+          const remoteAccess = ctx.remoteAccess || (typeof ctx.get === 'function' ? ctx.get('remoteAccess') : null);
+          if (remoteAccess && typeof remoteAccess.whenAccess === 'function') {
+            watchDispose = remoteAccess.whenAccess('account/watch', function* () {
+              const opened = openStream();
+              stream = opened;
+              consume(opened);
+              yield function () {
+                try { opened.dispose(); } catch (error) { /* noop */ }
+                if (stream === opened) stream = null;
+              };
+            });
+          } else {
+            stream = openStream();
+            consume(stream);
+          }
+        } catch (error) { /* polling remains */ }
+      }
+
+      function scheduleReconnect() {
+        if (disposed || retries >= STREAM_MAX_RETRIES) return;
+        retries += 1;
+        (typeof window !== 'undefined' && window.setTimeout ? window.setTimeout : setTimeout)(function () {
+          if (!disposed) connect();
+        }, STREAM_RETRY_MS);
+      }
+
+      function onVisibilityChange() {
+        if (typeof document !== 'undefined' && document.visibilityState === 'visible') refresh();
+      }
+
+      function start() {
+        refresh();
+        if (typeof window !== 'undefined' && typeof window.setInterval === 'function') {
+          timer = window.setInterval(function () {
+            if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+            refresh();
+          }, BALANCE_POLL_MS);
+        }
+        if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+          document.addEventListener('visibilitychange', onVisibilityChange);
+        }
+        connect();
+      }
+
+      function dispose() {
+        disposed = true;
+        if (timer !== null) { clearInterval(timer); timer = null; }
+        if (typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
+          document.removeEventListener('visibilitychange', onVisibilityChange);
+        }
+        if (typeof watchDispose === 'function') {
+          try { watchDispose(); } catch (error) { /* noop */ }
+          watchDispose = null;
+        }
+        if (stream && typeof stream.dispose === 'function') {
+          try { stream.dispose(); } catch (error) { /* noop */ }
+        }
+        stream = null;
+        listeners.clear();
+      }
+
+      return { subscribe: subscribe, getSnapshot: getSnapshot, refresh: refresh, start: start, dispose: dispose };
+    }
+
+    let balanceStore = null;
+    let runtimeCtx = null;
+
+    function refreshBalance() {
+      if (balanceStore) balanceStore.refresh();
+    }
+
     const CRY_CLIPS = [__PIKA_CLIPS__];
 
     const TEXT_EN = {
@@ -110,6 +352,18 @@ window.__ModuleLoader__.load({
       soundRowTitle: 'Pikachu Pet · Sound',
       soundRowDesc: 'Play a Pikachu cry when a task completes. You can also mute from the pet.',
       soundSwitch: 'Pikachu cry',
+      balanceTitle: 'Account balance',
+      balanceTopUp: 'Top-up balance',
+      balanceBonus: 'Bonus balance',
+      balanceUpdated: 'Updated {time}',
+      balanceLoading: '···',
+      balanceSignedOut: 'Signed out',
+      balanceError: 'Balance unavailable',
+      balanceRetry: 'Retry',
+      balanceRefresh: 'Refresh',
+      balanceGoLogin: 'Sign in',
+      balanceLoginHint: 'Sign in to see your balance.',
+      balanceUnavailable: 'Balance is unavailable in this build.',
     };
 
     const TEXT_ZH = {
@@ -128,6 +382,18 @@ window.__ModuleLoader__.load({
       soundRowTitle: '皮卡丘桌宠 · 声音',
       soundRowDesc: '任务完成时播放「皮卡皮卡」叫声；也可以悬停桌宠用按钮随时静音。',
       soundSwitch: '皮卡丘叫声',
+      balanceTitle: '账户余额',
+      balanceTopUp: '充值余额',
+      balanceBonus: '赠送余额',
+      balanceUpdated: '更新于 {time}',
+      balanceLoading: '···',
+      balanceSignedOut: '未登录',
+      balanceError: '余额读取失败',
+      balanceRetry: '重试',
+      balanceRefresh: '刷新',
+      balanceGoLogin: '去登录',
+      balanceLoginHint: '登录后即可查看余额。',
+      balanceUnavailable: '当前版本不支持账户余额。',
     };
 
     let translate = function (key) { return TEXT_ZH[key] || key; };
@@ -218,6 +484,25 @@ window.__ModuleLoader__.load({
       '@keyframes pkp-spark{0%,100%{opacity:0;transform:scale(.6);}50%{opacity:1;transform:scale(1.08);}}' +
       '@keyframes pkp-star{0%{opacity:0;transform:scale(.2) rotate(0deg);}40%{opacity:1;transform:scale(1.15) rotate(30deg);}100%{opacity:0;transform:scale(.4) rotate(60deg);}}' +
       '@keyframes pkp-bubble-in{0%{opacity:0;transform:translate(-50%,6px) scale(.8);}55%{opacity:1;transform:translate(-50%,-2px) scale(1.04);}100%{opacity:1;transform:translate(-50%,0) scale(1);}}' +
+      '.pkp-balance-wrap{position:relative;pointer-events:auto;margin-top:2px;line-height:0;}' +
+      '.pkp-balance-chip{min-width:58px;height:24px;padding:0 10px;border-radius:999px;border:1px solid var(--dsw-alias-border-l1,rgba(0,0,0,0.08));' +
+      'background:var(--pkp-bubble-bg);color:var(--dsw-alias-label-primary,#1f2329);font:600 12px/22px system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;' +
+      'cursor:pointer;box-shadow:0 4px 12px rgba(16,24,40,0.14);transition:opacity .18s ease,border-color .18s ease;}' +
+      '.pkp-balance-chip:hover{border-color:var(--dsw-alias-border-l2,rgba(0,0,0,0.16));}' +
+      '.pkp-balance-chip[data-phase="loading"]{opacity:.7;}' +
+      '.pkp-balance-chip[data-phase="error"],.pkp-balance-chip[data-phase="signed-out"]{color:var(--dsw-alias-label-secondary,#5b6472);}' +
+      '.pkp-balance-chip[data-stale="true"]{opacity:.6;}' +
+      '.pkp-balance-panel{position:absolute;right:calc(100% + 10px);bottom:0;width:212px;padding:10px 12px;border-radius:12px;' +
+      'background:var(--pkp-bubble-bg);border:1px solid var(--dsw-alias-border-l1,rgba(0,0,0,0.08));box-shadow:0 12px 28px rgba(16,24,40,0.2);' +
+      'font:12px/1.5 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;color:var(--dsw-alias-label-primary,#1f2329);text-align:left;}' +
+      '.pkp-balance-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px;font-weight:700;}' +
+      '.pkp-balance-refresh{border:0;background:none;color:var(--dsw-alias-label-secondary,#5b6472);cursor:pointer;font-size:14px;line-height:1;padding:2px 4px;border-radius:6px;}' +
+      '.pkp-balance-refresh:hover{background:var(--dsw-alias-bg-hover,rgba(0,0,0,0.05));}' +
+      '.pkp-balance-row{display:flex;justify-content:space-between;gap:12px;padding:2px 0;}' +
+      '.pkp-balance-row span:first-child{color:var(--dsw-alias-label-secondary,#5b6472);}' +
+      '.pkp-balance-note{margin-top:6px;color:var(--dsw-alias-label-secondary,#5b6472);font-size:11px;}' +
+      '.pkp-balance-action{margin-top:8px;border:0;border-radius:8px;padding:4px 10px;background:var(--dsw-alias-brand-primary,#4d6bfe);color:#fff;cursor:pointer;font:600 12px/20px system-ui;}' +
+      '@media (max-width:760px){.pkp-balance-panel{right:0;bottom:calc(100% + 6px);width:196px;}}' +
       '.pkp-pref-row{border-bottom:0.5px solid var(--dsw-alias-border-l2,rgba(0,0,0,0.14));justify-content:space-between;align-items:center;gap:24px;padding:16px 0;display:flex;}' +
       '.pkp-pref-title{color:var(--dsw-alias-label-primary,#1f2329);font-size:14px;line-height:20px;}' +
       '.pkp-pref-desc{color:var(--dsw-alias-label-secondary,#5b6472);margin-top:4px;font-size:12px;line-height:18px;}' +
@@ -492,6 +777,129 @@ window.__ModuleLoader__.load({
           h('img', { className: 'pkp-sprite', src: POSE_IMAGES.stand, alt: '', draggable: false })));
     }
 
+    function openAccountSettings() {
+      try {
+        const layout = runtimeCtx && (runtimeCtx.layout || (typeof runtimeCtx.get === 'function' ? runtimeCtx.get('layout') : null));
+        if (layout && typeof layout.selectPanel === 'function') layout.selectPanel('settings');
+      } catch (error) { /* hint remains */ }
+    }
+
+    function useBalance() {
+      const [snapshot, setSnapshot] = useState(function () {
+        return balanceStore ? balanceStore.getSnapshot() : { phase: 'unavailable' };
+      });
+      useEffect(function () {
+        if (!balanceStore) return undefined;
+        setSnapshot(balanceStore.getSnapshot());
+        return balanceStore.subscribe(function () { setSnapshot(balanceStore.getSnapshot()); });
+      }, []);
+      return snapshot;
+    }
+
+    function BalanceRow(props) {
+      return h('div', { className: 'pkp-balance-row' },
+        h('span', null, props.label),
+        h('span', null, props.value));
+    }
+
+    function BalanceChip() {
+      const state = useBalance();
+      const [open, setOpen] = useState(false);
+      if (!state || state.phase === 'unavailable') return null;
+
+      const locale = localeId(runtimeCtx);
+      const primary = pickPrimaryWallet(state.wallets);
+      const label = state.phase === 'signed-out'
+        ? translate('balanceSignedOut')
+        : state.phase === 'loading'
+          ? translate('balanceLoading')
+          : state.phase === 'error'
+            ? '—'
+            : primary ? formatWallet(primary, locale) : '—';
+
+      const time = state.updatedAt ? new Date(state.updatedAt).toLocaleTimeString(locale, { hour: '2-digit', minute: '2-digit' }) : '';
+
+      const rows = [];
+      state.wallets.forEach(function (wallet, index) {
+        rows.push(h(BalanceRow, {
+          key: 'top-' + index,
+          label: index === 0 ? translate('balanceTopUp') : '',
+          value: formatWallet(wallet, locale),
+        }));
+      });
+      state.bonusWallets.forEach(function (wallet, index) {
+        rows.push(h(BalanceRow, {
+          key: 'bonus-' + index,
+          label: index === 0 ? translate('balanceBonus') : '',
+          value: formatWallet(wallet, locale),
+        }));
+      });
+
+      const panel = open
+        ? h('div', {
+          className: 'pkp-balance-panel',
+          id: 'pkp-balance-panel',
+          role: 'region',
+          'aria-label': translate('balanceTitle'),
+        },
+        h('div', { className: 'pkp-balance-head' },
+          h('span', null, translate('balanceTitle')),
+          state.phase === 'ready'
+            ? h('button', {
+              className: 'pkp-balance-refresh',
+              type: 'button',
+              title: translate('balanceRefresh'),
+              onClick: function (event) { event.stopPropagation(); refreshBalance(); },
+            }, '↻')
+            : null),
+        state.phase === 'ready'
+          ? h('div', null,
+            rows.length ? rows : h('div', { className: 'pkp-balance-row' }, h('span', null, '—')),
+            time ? h('div', { className: 'pkp-balance-note' }, translate('balanceUpdated').replace('{time}', time)) : null)
+          : state.phase === 'signed-out'
+            ? h('div', null,
+              h('div', { className: 'pkp-balance-note' }, translate('balanceLoginHint')),
+              h('button', {
+                className: 'pkp-balance-action',
+                type: 'button',
+                onClick: function (event) { event.stopPropagation(); openAccountSettings(); },
+              }, translate('balanceGoLogin')))
+            : state.phase === 'error'
+              ? h('div', null,
+                h('div', { className: 'pkp-balance-note' }, translate('balanceError')),
+                h('button', {
+                  className: 'pkp-balance-action',
+                  type: 'button',
+                  onClick: function (event) { event.stopPropagation(); refreshBalance(); },
+                }, translate('balanceRetry')))
+              : h('div', { className: 'pkp-balance-note' }, translate('balanceLoading')))
+        : null;
+
+      return h('div', {
+        className: 'pkp-balance-wrap',
+        onMouseEnter: function () { setOpen(true); },
+        onMouseLeave: function () { setOpen(false); },
+        onKeyDown: function (event) {
+          if (event.key === 'Escape') setOpen(false);
+        },
+        onBlur: function (event) {
+          if (!event.currentTarget.contains(event.relatedTarget)) setOpen(false);
+        },
+      },
+      h('button', {
+        className: 'pkp-balance-chip',
+        type: 'button',
+        'data-phase': state.phase,
+        'data-stale': state.stale ? 'true' : 'false',
+        'aria-expanded': open,
+        'aria-controls': open ? 'pkp-balance-panel' : undefined,
+        title: state.stale ? translate('balanceError') : translate('balanceTitle'),
+        onClick: function () { setOpen(!open); },
+        onFocus: function () { setOpen(true); },
+      }, label),
+      panel);
+    }
+
     function PetLive(props) {
       const useSessions = props.useSessions;
       const useSessionStatus = props.useSessionStatus;
@@ -535,6 +943,7 @@ window.__ModuleLoader__.load({
         if (previous.targetId !== mood.targetId) return;
         if (previous.running === true && mood.running === false && !mood.waiting) {
           setCelebrating(true);
+          refreshBalance();
           if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
             const engine = engineRef.current;
             if (engine && soundOnRef.current) engine.play();
@@ -649,7 +1058,8 @@ window.__ModuleLoader__.load({
         },
         h('div', { className: 'pkp-stage' },
           h('img', { className: 'pkp-sprite', src: POSE_IMAGES[poseKey], alt: '', draggable: false }),
-          h('div', { className: 'pkp-fx', dangerouslySetInnerHTML: { __html: FX } }))));
+          h('div', { className: 'pkp-fx', dangerouslySetInnerHTML: { __html: FX } }))),
+        h(BalanceChip, null));
     }
 
     /* Settings → General row that owns the sound preference. */
@@ -678,7 +1088,17 @@ window.__ModuleLoader__.load({
     return {
       inject: ['slots'],
       apply(ctx) {
+        runtimeCtx = ctx;
         installLocale(ctx);
+        ctx.effect(function () {
+          if (balanceStore) balanceStore.dispose();
+          balanceStore = createBalanceStore(ctx);
+          balanceStore.start();
+          return function () {
+            balanceStore.dispose();
+            balanceStore = null;
+          };
+        }, 'pikachu-pet: balance');
         ctx.slots.inject('shell.overlay', function () {
           return ctx.slots.register({
             name: 'shell.overlay',
@@ -694,6 +1114,13 @@ window.__ModuleLoader__.load({
             order: 25,
           }, SoundSettingsRow);
         });
+      },
+      __test: {
+        clientVersion: clientVersion,
+        localeId: localeId,
+        formatWallet: formatWallet,
+        pickPrimaryWallet: pickPrimaryWallet,
+        createBalanceStore: createBalanceStore,
       },
     };
   },

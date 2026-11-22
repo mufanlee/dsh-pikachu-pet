@@ -83,10 +83,12 @@ for (const name of clips) {
 
 // 6) module/apply smoke test with stubbed browser globals and React
 if (built) {
+  let plugin = null;
   try {
     let definition = null;
     const windowStub = {
       __ModuleLoader__: { load: (value) => { definition = value; } },
+      __DSH_BOOT__: { release: { version: '9.9.9' } },
       localStorage: { getItem: () => null, setItem: () => {} },
       addEventListener: () => {},
       removeEventListener: () => {},
@@ -103,7 +105,7 @@ if (built) {
     };
     new Function('window', 'require', built.source)(windowStub, requireStub);
     check(Boolean(definition && definition.factory), 'module factory was not registered');
-    const plugin = definition.factory(requireStub);
+    plugin = definition.factory(requireStub);
     check(Boolean(plugin && typeof plugin.apply === 'function'), 'factory did not return apply()');
 
     const registrations = [];
@@ -111,8 +113,24 @@ if (built) {
       inject: (_key, callback) => { callback(); return () => {}; },
       register: (options) => { registrations.push(options.id); return () => {}; },
     };
+    const accountStub = {
+      getBalance: async () => ({
+        ok: true,
+        value: {
+          status: 'ready',
+          value: [{ currency: 'CNY', balance: '12.34' }],
+          bonusWallets: [{ currency: 'CNY', balance: '1.00' }],
+        },
+      }),
+      watch: async function* () {},
+    };
+    const remoteStub = {
+      account: accountStub,
+      $stream: () => ({ dispose: () => {}, [Symbol.asyncIterator]: async function* () {} }),
+    };
     plugin.apply({
       get: () => undefined,
+      remote: remoteStub,
       effect: (callback) => callback(),
       slots: slotsStub,
     });
@@ -131,6 +149,18 @@ if (built) {
       slots: slotsStub,
     });
     check(Boolean(localeRegistered && localeRegistered.dicts && localeRegistered.dicts.en && localeRegistered.dicts.zh), 'locale dictionaries were not registered');
+
+    const testApi = (plugin && plugin.__test) || {};
+    check(typeof testApi.formatWallet === 'function', 'missing __test.formatWallet');
+    check(typeof testApi.pickPrimaryWallet === 'function', 'missing __test.pickPrimaryWallet');
+    check(testApi.clientVersion() === '9.9.9', 'clientVersion should read __DSH_BOOT__.release.version');
+    check(testApi.formatWallet({ currency: 'CNY', balance: '12.34' }, 'zh-CN').includes('12.34'), 'CNY formatting failed');
+    check(testApi.formatWallet({ currency: 'USD', balance: '3.5' }, 'en-US').includes('3.50'), 'USD formatting failed');
+    check(testApi.formatWallet({ currency: 'CNY', balance: 'oops' }, 'zh-CN') === 'oops', 'invalid amount should pass through');
+    check(testApi.pickPrimaryWallet([{ currency: 'USD', balance: '1' }, { currency: 'CNY', balance: '2' }]).currency === 'CNY', 'primary wallet should prefer CNY');
+    check(typeof testApi.createBalanceStore === 'function', 'missing __test.createBalanceStore');
+    check(/account\.getBalance/.test(built.source), 'client.js should call account.getBalance');
+    check(/account\.watch/.test(built.source), 'client.js should watch account state');
   } catch (error) {
     problems.push('module smoke test failed: ' + error.message);
   }

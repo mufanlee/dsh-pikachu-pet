@@ -1,9 +1,9 @@
 {
   "name": "@local/dsh-pikachu-pet",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
-  "description": "Unofficial fan-made Pikachu desktop pet plugin for the DeepSeek Harness Web GUI.",
+  "description": "Unofficial fan-made Pikachu desktop pet plugin for the DeepSeek Harness Web GUI. Shows the DeepSeek account balance beside the pet.",
   "license": "MIT",
   "exports": {
     ".": "./index.js",
